@@ -29,7 +29,28 @@
 
 const char libtar_version[] = PACKAGE_VERSION;
 
-static tartype_t default_type = { open, close, read, write };
+static intptr_t tar_openfunc(const char *pathname, int flags, int mode)
+{
+	return (intptr_t)open(pathname, flags, mode);
+}
+
+static int tar_closefunc(intptr_t fd)
+{
+	return close((int)fd);
+}
+
+static ssize_t tar_readfunc(intptr_t fd, void *buf, size_t count)
+{
+	return read((int)fd, buf, count);
+}
+
+static ssize_t tar_writefunc(intptr_t fd, const void *buf, size_t count)
+{
+	return write((int)fd, buf, count);
+}
+
+static tartype_t default_type = { tar_openfunc, tar_closefunc,
+				  tar_readfunc, tar_writefunc };
 
 
 static int
@@ -105,7 +126,7 @@ tar_fdopen(TAR **t, int fd, const char *pathname, tartype_t *type,
 }
 
 
-int
+intptr_t
 tar_fd(TAR *t)
 {
 	return t->fd;
