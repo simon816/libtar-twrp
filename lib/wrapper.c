@@ -28,7 +28,7 @@ tar_extract_glob(TAR *t, char *globname, char *prefix)
 {
 	char *filename;
 	char buf[MAXPATHLEN];
-	int i;
+	int i, fd = 0;
 
 	while ((i = th_read(t)) == 0)
 	{
@@ -45,7 +45,7 @@ tar_extract_glob(TAR *t, char *globname, char *prefix)
 			snprintf(buf, sizeof(buf), "%s/%s", prefix, filename);
 		else
 			strlcpy(buf, filename, sizeof(buf));
-		if (tar_extract_file(t, buf) != 0)
+		if (tar_extract_file(t, buf, prefix, &fd) != 0)
 			return -1;
 	}
 
@@ -54,7 +54,7 @@ tar_extract_glob(TAR *t, char *globname, char *prefix)
 
 
 int
-tar_extract_all(TAR *t, char *prefix)
+tar_extract_all(TAR *t, char *prefix, const int *progress_fd)
 {
 	char *filename;
 	char buf[MAXPATHLEN];
@@ -81,7 +81,7 @@ tar_extract_all(TAR *t, char *prefix)
 		printf("    tar_extract_all(): calling tar_extract_file(t, "
 		       "\"%s\")\n", buf);
 #endif
-		if (tar_extract_file(t, buf) != 0)
+		if (tar_extract_file(t, buf, prefix, progress_fd) != 0)
 			return -1;
 	}
 
@@ -151,3 +151,31 @@ tar_append_tree(TAR *t, char *realdir, char *savedir)
 }
 
 
+int
+tar_find(TAR *t, char *searchstr)
+{
+	if (!searchstr)
+		return 0;
+
+	char *filename;
+	int i, entryfound = 0;
+#ifdef DEBUG
+	printf("==> tar_find(0x%lx, %s)\n", (long unsigned int)t, searchstr);
+#endif
+	while ((i = th_read(t)) == 0) {
+		filename = th_get_pathname(t);
+		if (fnmatch(searchstr, filename, FNM_FILE_NAME | FNM_PERIOD) == 0) {
+			entryfound++;
+#ifdef DEBUG
+			printf("Found matching entry: %s\n", filename);
+#endif
+			break;
+		}
+	}
+#ifdef DEBUG
+	if (!entryfound)
+		printf("No matching entry found.\n");
+#endif
+
+	return entryfound;
+}

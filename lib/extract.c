@@ -12,6 +12,7 @@
 
 #include <internal.h>
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/param.h>
@@ -19,6 +20,10 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <utime.h>
+
+#include <sys/capability.h>
+#include <sys/xattr.h>
+#include <linux/xattr.h>
 
 #ifdef STDC_HEADERS
 # include <stdlib.h>
@@ -28,21 +33,36 @@
 # include <unistd.h>
 #endif
 
+#include <selinux/selinux.h>
+
+#ifdef HAVE_EXT4_CRYPT
+# include "ext4crypt_tar.h"
+#endif
+#include "android_utils.h"
+
+const unsigned long long progress_size = (unsigned long long)(T_BLOCKSIZE);
 
 static int
-tar_set_file_perms(TAR *t, char *realname)
+tar_set_file_perms(TAR *t, const char *realname)
 {
 	mode_t mode;
 	uid_t uid;
 	gid_t gid;
 	struct utimbuf ut;
-	char *filename;
+	const char *filename;
+	char *pn;
 
-	filename = (realname ? realname : th_get_pathname(t));
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	mode = th_get_mode(t);
 	uid = th_get_uid(t);
 	gid = th_get_gid(t);
 	ut.modtime = ut.actime = th_get_mtime(t);
+
+#ifdef DEBUG
+	printf("tar_set_file_perms(): setting perms: %s (mode %04o, uid %d, gid %d)\n",
+		filename, mode, uid, gid);
+#endif
 
 	/* change owner/group */
 	if (geteuid() == 0)
@@ -88,12 +108,15 @@ tar_set_file_perms(TAR *t, char *realname)
 
 /* switchboard */
 int
-tar_extract_file(TAR *t, char *realname)
+tar_extract_file(TAR *t, const char *realname, const char *prefix, const int *progress_fd)
 {
 	int i;
+#ifdef LIBTAR_FILE_HASH
 	char *lnp;
+	char *pn;
 	int pathname_len;
 	int realname_len;
+#endif
 
 	if (t->options & TAR_NOOVERWRITE)
 	{
@@ -113,7 +136,7 @@ tar_extract_file(TAR *t, char *realname)
 			i = 0;
 	}
 	else if (TH_ISLNK(t))
-		i = tar_extract_hardlink(t, realname);
+		i = tar_extract_hardlink(t, realname, prefix);
 	else if (TH_ISSYM(t))
 		i = tar_extract_symlink(t, realname);
 	else if (TH_ISCHR(t))
@@ -123,28 +146,55 @@ tar_extract_file(TAR *t, char *realname)
 	else if (TH_ISFIFO(t))
 		i = tar_extract_fifo(t, realname);
 	else /* if (TH_ISREG(t)) */
-		i = tar_extract_regfile(t, realname);
+		i = tar_extract_regfile(t, realname, progress_fd);
 
-	if (i != 0)
+	if (i != 0) {
+		fprintf(stderr, "tar_extract_file(): failed to extract %s !!!\n", realname);
 		return i;
+	}
 
 	i = tar_set_file_perms(t, realname);
-	if (i != 0)
+	if (i != 0) {
+		fprintf(stderr, "tar_extract_file(): failed to set permissions on %s !!!\n", realname);
 		return i;
+	}
 
-	pathname_len = strlen(th_get_pathname(t)) + 1;
+	if((t->options & TAR_STORE_SELINUX) && t->th_buf.selinux_context != NULL)
+	{
+#ifdef DEBUG
+		printf("tar_extract_file(): restoring SELinux context %s to file %s\n", t->th_buf.selinux_context, realname);
+#endif
+		if (lsetfilecon(realname, t->th_buf.selinux_context) < 0)
+			fprintf(stderr, "tar_extract_file(): failed to restore SELinux context %s to file %s !!!\n", t->th_buf.selinux_context, realname);
+	}
+
+	if((t->options & TAR_STORE_POSIX_CAP) && t->th_buf.has_cap_data)
+	{
+#if 1 //def DEBUG
+		printf("tar_extract_file(): restoring posix capabilities to file %s\n", realname);
+		print_caps(&t->th_buf.cap_data);
+#endif
+		if (setxattr(realname, XATTR_NAME_CAPS, &t->th_buf.cap_data, sizeof(struct vfs_cap_data), 0) < 0)
+			fprintf(stderr, "tar_extract_file(): failed to restore posix capabilities to file %s !!!\n", realname);
+	}
+
+#ifdef LIBTAR_FILE_HASH
+	pn = th_get_pathname(t);
+	pathname_len = strlen(pn) + 1;
 	realname_len = strlen(realname) + 1;
 	lnp = (char *)calloc(1, pathname_len + realname_len);
 	if (lnp == NULL)
 		return -1;
-	strcpy(&lnp[0], th_get_pathname(t));
+	strcpy(&lnp[0], pn);
 	strcpy(&lnp[pathname_len], realname);
 #ifdef DEBUG
 	printf("tar_extract_file(): calling libtar_hash_add(): key=\"%s\", "
-	       "value=\"%s\"\n", th_get_pathname(t), realname);
+	       "value=\"%s\"\n", pn, realname);
 #endif
 	if (libtar_hash_add(t->h, lnp) != 0)
 		return -1;
+	free(lnp);
+#endif
 
 	return 0;
 }
@@ -152,20 +202,17 @@ tar_extract_file(TAR *t, char *realname)
 
 /* extract regular file */
 int
-tar_extract_regfile(TAR *t, char *realname)
+tar_extract_regfile(TAR *t, const char *realname, const int *progress_fd)
 {
-	mode_t mode;
-	size_t size;
-	uid_t uid;
-	gid_t gid;
+	int64_t size, i;
+	ssize_t k;
 	int fdout;
-	int i, k;
 	char buf[T_BLOCKSIZE];
-	char *filename;
+	const char *filename;
+	char *pn;
 
 #ifdef DEBUG
-	printf("==> tar_extract_regfile(t=0x%lx, realname=\"%s\")\n", t,
-	       realname);
+	printf("  ==> tar_extract_regfile(realname=\"%s\")\n", realname);
 #endif
 
 	if (!TH_ISREG(t))
@@ -174,19 +221,16 @@ tar_extract_regfile(TAR *t, char *realname)
 		return -1;
 	}
 
-	filename = (realname ? realname : th_get_pathname(t));
-	mode = th_get_mode(t);
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	size = th_get_size(t);
-	uid = th_get_uid(t);
-	gid = th_get_gid(t);
 
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-#ifdef DEBUG
-	printf("  ==> extracting: %s (mode %04o, uid %d, gid %d, %d bytes)\n",
-	       filename, mode, uid, gid, size);
-#endif
+	printf("  ==> extracting: %s (file size %" PRId64 " bytes)\n",
+			filename, size);
+
 	fdout = open(filename, O_WRONLY | O_CREAT | O_TRUNC
 #ifdef O_BINARY
 		     | O_BINARY
@@ -199,26 +243,6 @@ tar_extract_regfile(TAR *t, char *realname)
 #endif
 		return -1;
 	}
-
-#if 0
-	/* change the owner.  (will only work if run as root) */
-	if (fchown(fdout, uid, gid) == -1 && errno != EPERM)
-	{
-#ifdef DEBUG
-		perror("fchown()");
-#endif
-		return -1;
-	}
-
-	/* make sure the mode isn't inheritted from a file we're overwriting */
-	if (fchmod(fdout, mode & 07777) == -1)
-	{
-#ifdef DEBUG
-		perror("fchmod()");
-#endif
-		return -1;
-	}
-#endif
 
 	/* extract the file */
 	for (i = size; i > 0; i -= T_BLOCKSIZE)
@@ -239,6 +263,11 @@ tar_extract_regfile(TAR *t, char *realname)
 			close(fdout);
 			return -1;
 		}
+		else
+		{
+			if (*progress_fd != 0)
+				write(*progress_fd, &progress_size, sizeof(progress_size));
+		}
 	}
 
 	/* close output file */
@@ -257,8 +286,8 @@ tar_extract_regfile(TAR *t, char *realname)
 int
 tar_skip_regfile(TAR *t)
 {
-	int i, k;
-	size_t size;
+	int64_t size, i;
+	ssize_t k;
 	char buf[T_BLOCKSIZE];
 
 	if (!TH_ISREG(t))
@@ -285,10 +314,12 @@ tar_skip_regfile(TAR *t)
 
 /* hardlink */
 int
-tar_extract_hardlink(TAR * t, char *realname)
+tar_extract_hardlink(TAR * t, const char *realname, const char *prefix)
 {
-	char *filename;
+	const char *filename;
+	char *pn;
 	char *linktgt = NULL;
+	char *newtgt = NULL;
 	char *lnp;
 	libtar_hashptr_t hp;
 
@@ -298,8 +329,11 @@ tar_extract_hardlink(TAR * t, char *realname)
 		return -1;
 	}
 
-	filename = (realname ? realname : th_get_pathname(t));
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	if (mkdirhier(dirname(filename)) == -1)
+		return -1;
+	if (unlink(filename) == -1 && errno != ENOENT)
 		return -1;
 	libtar_hashptr_reset(&hp);
 	if (libtar_hash_getkey(t->h, &hp, th_get_linkname(t),
@@ -311,15 +345,15 @@ tar_extract_hardlink(TAR * t, char *realname)
 	else
 		linktgt = th_get_linkname(t);
 
-#ifdef DEBUG
+	newtgt = strdup(linktgt);
+	sprintf(linktgt, "%s/%s", prefix, newtgt);
+
 	printf("  ==> extracting: %s (link to %s)\n", filename, linktgt);
-#endif
+
 	if (link(linktgt, filename) == -1)
 	{
-#ifdef DEBUG
-		perror("link()");
-#endif
-		return -1;
+		fprintf(stderr, "tar_extract_hardlink(): failed restore of hardlink '%s' but returning as if nothing bad happened\n", filename);
+		return 0; // Used to be -1
 	}
 
 	return 0;
@@ -328,9 +362,10 @@ tar_extract_hardlink(TAR * t, char *realname)
 
 /* symlink */
 int
-tar_extract_symlink(TAR *t, char *realname)
+tar_extract_symlink(TAR *t, const char *realname)
 {
-	char *filename;
+	const char *filename;
+	char *pn;
 
 	if (!TH_ISSYM(t))
 	{
@@ -338,17 +373,17 @@ tar_extract_symlink(TAR *t, char *realname)
 		return -1;
 	}
 
-	filename = (realname ? realname : th_get_pathname(t));
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
 	if (unlink(filename) == -1 && errno != ENOENT)
 		return -1;
 
-#ifdef DEBUG
 	printf("  ==> extracting: %s (symlink to %s)\n",
 	       filename, th_get_linkname(t));
-#endif
+
 	if (symlink(th_get_linkname(t), filename) == -1)
 	{
 #ifdef DEBUG
@@ -363,11 +398,12 @@ tar_extract_symlink(TAR *t, char *realname)
 
 /* character device */
 int
-tar_extract_chardev(TAR *t, char *realname)
+tar_extract_chardev(TAR *t, const char *realname)
 {
 	mode_t mode;
 	unsigned long devmaj, devmin;
-	char *filename;
+	const char *filename;
+	char *pn;
 
 	if (!TH_ISCHR(t))
 	{
@@ -375,7 +411,8 @@ tar_extract_chardev(TAR *t, char *realname)
 		return -1;
 	}
 
-	filename = (realname ? realname : th_get_pathname(t));
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	mode = th_get_mode(t);
 	devmaj = th_get_devmajor(t);
 	devmin = th_get_devminor(t);
@@ -383,17 +420,14 @@ tar_extract_chardev(TAR *t, char *realname)
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-#ifdef DEBUG
 	printf("  ==> extracting: %s (character device %ld,%ld)\n",
 	       filename, devmaj, devmin);
-#endif
+
 	if (mknod(filename, mode | S_IFCHR,
 		  compat_makedev(devmaj, devmin)) == -1)
 	{
-#ifdef DEBUG
-		perror("mknod()");
-#endif
-		return -1;
+		fprintf(stderr, "tar_extract_chardev(): failed restore of character device '%s' but returning as if nothing bad happened\n", filename);
+		return 0; // Used to be -1
 	}
 
 	return 0;
@@ -402,11 +436,12 @@ tar_extract_chardev(TAR *t, char *realname)
 
 /* block device */
 int
-tar_extract_blockdev(TAR *t, char *realname)
+tar_extract_blockdev(TAR *t, const char *realname)
 {
 	mode_t mode;
 	unsigned long devmaj, devmin;
-	char *filename;
+	const char *filename;
+	char *pn;
 
 	if (!TH_ISBLK(t))
 	{
@@ -414,7 +449,8 @@ tar_extract_blockdev(TAR *t, char *realname)
 		return -1;
 	}
 
-	filename = (realname ? realname : th_get_pathname(t));
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	mode = th_get_mode(t);
 	devmaj = th_get_devmajor(t);
 	devmin = th_get_devminor(t);
@@ -422,46 +458,42 @@ tar_extract_blockdev(TAR *t, char *realname)
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-#ifdef DEBUG
 	printf("  ==> extracting: %s (block device %ld,%ld)\n",
 	       filename, devmaj, devmin);
-#endif
+
 	if (mknod(filename, mode | S_IFBLK,
 		  compat_makedev(devmaj, devmin)) == -1)
 	{
-#ifdef DEBUG
-		perror("mknod()");
-#endif
-		return -1;
+		fprintf(stderr, "tar_extract_blockdev(): failed restore of block device '%s' but returning as if nothing bad happened\n", filename);
+		return 0; // Used to be -1
 	}
 
 	return 0;
 }
 
-
 /* directory */
 int
-tar_extract_dir(TAR *t, char *realname)
+tar_extract_dir(TAR *t, const char *realname)
 {
 	mode_t mode;
-	char *filename;
+	const char *filename;
+	char *pn;
 
 	if (!TH_ISDIR(t))
 	{
 		errno = EINVAL;
 		return -1;
 	}
-
-	filename = (realname ? realname : th_get_pathname(t));
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	mode = th_get_mode(t);
 
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-#ifdef DEBUG
 	printf("  ==> extracting: %s (mode %04o, directory)\n", filename,
 	       mode);
-#endif
+
 	if (mkdir(filename, mode) == -1)
 	{
 		if (errno == EEXIST)
@@ -475,7 +507,7 @@ tar_extract_dir(TAR *t, char *realname)
 			}
 			else
 			{
-#ifdef DEBUG
+#if 1 //def DEBUG
 				puts("  *** using existing directory");
 #endif
 				return 1;
@@ -490,16 +522,67 @@ tar_extract_dir(TAR *t, char *realname)
 		}
 	}
 
+	if (t->options & TAR_STORE_ANDROID_USER_XATTR)
+	{
+		if (t->th_buf.has_user_default) {
+#if 1 //def DEBUG
+			printf("tar_extract_file(): restoring android user.default xattr to %s\n", realname);
+#endif
+			if (setxattr(realname, "user.default", NULL, 0, 0) < 0) {
+				fprintf(stderr, "tar_extract_file(): failed to restore android user.default to file %s !!!\n", realname);
+				return -1;
+			}
+		}
+		if (t->th_buf.has_user_cache) {
+#if 1 //def DEBUG
+			printf("tar_extract_file(): restoring android user.inode_cache xattr to %s\n", realname);
+#endif
+			if (write_path_inode(realname, "cache", "user.inode_cache"))
+				return -1;
+		}
+		if (t->th_buf.has_user_code_cache) {
+#if 1 //def DEBUG
+			printf("tar_extract_file(): restoring android user.inode_code_cache xattr to %s\n", realname);
+#endif
+			if (write_path_inode(realname, "code_cache", "user.inode_code_cache"))
+				return -1;
+		}
+	}
+
+#ifdef HAVE_EXT4_CRYPT
+	if(t->th_buf.eep != NULL)
+	{
+#ifdef DEBUG
+		printf("tar_extract_file(): restoring EXT4 crypt policy %s to dir %s\n", t->th_buf.eep->master_key_descriptor, realname);
+#endif
+		char binary_policy[EXT4_KEY_DESCRIPTOR_SIZE];
+		if (!lookup_ref_tar(t->th_buf.eep->master_key_descriptor, &binary_policy[0])) {
+			printf("error looking up proper e4crypt policy for '%s' - %s\n", realname, t->th_buf.eep->master_key_descriptor);
+			return -1;
+		}
+		char policy_hex[EXT4_KEY_DESCRIPTOR_SIZE_HEX];
+		policy_to_hex(binary_policy, policy_hex);
+		printf("restoring policy %s > '%s' to '%s'\n", t->th_buf.eep->master_key_descriptor, policy_hex, realname);
+		memcpy(&t->th_buf.eep->master_key_descriptor, binary_policy, EXT4_KEY_DESCRIPTOR_SIZE);
+		if (!e4crypt_policy_set_struct(realname, t->th_buf.eep))
+		{
+			printf("tar_extract_file(): failed to restore EXT4 crypt policy to dir '%s' '%s'!!!\n", realname, policy_hex);
+			//return -1; // This may not be an error in some cases, so log and ignore
+		}
+	}
+#endif
+
 	return 0;
 }
 
 
 /* FIFO */
 int
-tar_extract_fifo(TAR *t, char *realname)
+tar_extract_fifo(TAR *t, const char *realname)
 {
 	mode_t mode;
-	char *filename;
+	const char *filename;
+	char *pn;
 
 	if (!TH_ISFIFO(t))
 	{
@@ -507,15 +590,16 @@ tar_extract_fifo(TAR *t, char *realname)
 		return -1;
 	}
 
-	filename = (realname ? realname : th_get_pathname(t));
+	pn = th_get_pathname(t);
+	filename = (realname ? realname : pn);
 	mode = th_get_mode(t);
 
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-#ifdef DEBUG
+
 	printf("  ==> extracting: %s (fifo)\n", filename);
-#endif
+
 	if (mkfifo(filename, mode) == -1)
 	{
 #ifdef DEBUG
@@ -527,4 +611,57 @@ tar_extract_fifo(TAR *t, char *realname)
 	return 0;
 }
 
+/* extract file contents from a tarchive */
+int
+tar_extract_file_contents(TAR *t, void *buf, size_t *lenp)
+{
+	char block[T_BLOCKSIZE];
+	int64_t size, i;
+	ssize_t k;
 
+#ifdef DEBUG
+	printf("  ==> tar_extract_file_contents\n");
+#endif
+
+	if (!TH_ISREG(t))
+	{
+		errno = EINVAL;
+		return -1;
+	}
+
+	size = th_get_size(t);
+	if ((uint64_t)size > *lenp)
+	{
+		errno = ENOSPC;
+		return -1;
+	}
+
+	/* extract the file */
+	for (i = size; i >= T_BLOCKSIZE; i -= T_BLOCKSIZE)
+	{
+		k = tar_block_read(t, buf);
+		if (k != T_BLOCKSIZE)
+		{
+			if (k != -1)
+				errno = EINVAL;
+			return -1;
+		}
+		buf = (char *)buf + T_BLOCKSIZE;
+	}
+	if (i > 0) {
+		k = tar_block_read(t, block);
+		if (k != T_BLOCKSIZE)
+		{
+			if (k != -1)
+				errno = EINVAL;
+			return -1;
+		}
+		memcpy(buf, block, i);
+	}
+	*lenp = (size_t)size;
+
+#ifdef DEBUG
+	printf("### done extracting contents\n");
+#endif
+	return 0;
+}

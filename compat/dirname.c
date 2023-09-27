@@ -28,7 +28,7 @@
  */
 
 #ifndef lint
-static char rcsid[] = "$OpenBSD: dirname.c,v 1.4 1999/05/30 17:10:30 espie Exp $";
+//static char rcsid[] = "$OpenBSD: dirname.c,v 1.4 1999/05/30 17:10:30 espie Exp $";
 #endif /* not lint */
 
 #include <errno.h>
@@ -67,7 +67,7 @@ openbsd_dirname(path)
 		} while (endp > path && *endp == '/');
 	}
 
-	if (endp - path + 1 > sizeof(bname)) {
+	if (endp - path + 1 > (int)sizeof(bname)) {
 		errno = ENAMETOOLONG;
 		return(NULL);
 	}
