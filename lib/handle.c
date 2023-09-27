@@ -10,6 +10,8 @@
 **  University of Illinois at Urbana-Champaign
 */
 
+#define __unused __attribute_used__
+
 #include <internal.h>
 
 #include <stdio.h>

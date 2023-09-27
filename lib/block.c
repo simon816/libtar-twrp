@@ -10,12 +10,15 @@
 **  University of Illinois at Urbana-Champaign
 */
 
+#include <stdint.h>
+
 #include <internal.h>
 #include <errno.h>
 
 #ifdef STDC_HEADERS
 # include <string.h>
 # include <stdlib.h>
+# include <stdio.h>
 #endif
 
 #ifdef HAVE_EXT4_CRYPT

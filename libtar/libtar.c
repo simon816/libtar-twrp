@@ -250,7 +250,8 @@ extract(char *tarfile, char *rootdir)
 #ifdef DEBUG
 	puts("extracting tarfile...");
 #endif
-	if (tar_extract_all(t, rootdir) != 0)
+	int null_fd = 0;
+	if (tar_extract_all(t, rootdir, &null_fd) != 0)
 	{
 		fprintf(stderr, "tar_extract_all(): %s\n", strerror(errno));
 		tar_close(t);

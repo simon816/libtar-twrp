@@ -52,6 +52,8 @@ fi
 dnl ### Checks for header files. ###################################
 AC_HEADER_STDC
 AC_CHECK_HEADERS([unistd.h])
+AC_CHECK_HEADERS([sys/capability.h], [], [AC_MSG_ERROR([Couldn't find sys/capability.h])])
+AC_CHECK_HEADERS([selinux/selinux.h], [], [AC_MSG_ERROR([Couldn't find selinux/selinux.h])])
 AC_HEADER_MAJOR
 PSG_REPLACE_TYPE([major_t], [unsigned int], [
   #include <sys/types.h>
@@ -118,6 +120,7 @@ if test "$with_zlib" = "yes"; then
   AC_CHECK_LIB([z], [gzread])
 fi
 
+AC_CHECK_LIB([selinux], [lgetfilecon], [], [AC_MSG_ERROR([Could not find libselinux])])
 
 dnl ### Create output files. #######################################
 AC_CONFIG_FILES([Makefile lib/Makefile libtar/Makefile doc/Makefile])
