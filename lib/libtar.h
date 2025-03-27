@@ -82,7 +82,7 @@ struct tar_header
 
 /***** handle.c ************************************************************/
 
-typedef intptr_t (*openfunc_t)(const char *, int, ...);
+typedef intptr_t (*openfunc_t)(const char *, int, int);
 typedef int (*closefunc_t)(intptr_t);
 typedef ssize_t (*readfunc_t)(intptr_t, void *, size_t);
 typedef ssize_t (*writefunc_t)(intptr_t, const void *, size_t);
