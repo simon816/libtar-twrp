@@ -57,7 +57,7 @@ segv_handler(int sig)
 
 int use_zlib = 0;
 
-int
+intptr_t
 gzopen_frontend(char *pathname, int oflags, int mode)
 {
 	char *gzoflags;
@@ -99,7 +99,7 @@ gzopen_frontend(char *pathname, int oflags, int mode)
 	   size and placement of integers is different than pointers.
 	   However, to fix the problem 4 wrapper functions would be needed and
 	   an extra bit of data associating GZF with the wrapper functions.  */
-	return (int)gzf;
+	return (intptr_t)gzf;
 }
 
 tartype_t gztype = { (openfunc_t) gzopen_frontend, (closefunc_t) gzclose,
